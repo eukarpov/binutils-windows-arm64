@@ -1530,15 +1530,10 @@ pe_find_data_imports (const char *symhead,
 	    undef->u.def.value = sym->u.def.value;
 	    undef->u.def.section = sym->u.def.section;
 
-#if !defined (COFF_WITH_peAArch64)
 	    /* We replace the original name with the __imp_ prefixed one, this
 	       1) may trash memory 2) leads to duplicate symbols.  But this is
-	       better than having a misleading name that can confuse GDB.
-
-	       On AArch64, it should not be changed, as a jump stub will be generated
-	       for the same function name.  */
+	       better than having a misleading name that can confuse GDB.  */
 	    undef->root.string = sym->root.string;
-#endif
 
 	    if (link_info.pei386_auto_import == -1)
 	      {
@@ -1770,7 +1765,7 @@ generate_reloc (bfd *abfd, struct bfd_link_info *info)
   /* This can happen for example when LTO has eliminated all code.  */
   if (total_relocs == 0)
     return;
-  
+
   /* At this point, we have total_relocs relocation addresses in
      reloc_addresses, which are all suitable for the .reloc section.
      We must now create the new sections.  */
@@ -2902,12 +2897,134 @@ aarch64_make_jump_stub(const char* symbol_name, bfd* parent)
   bfd_make_readable (abfd);
   add_bfd_to_link (abfd, bfd_get_filename (abfd), &link_info);
 }
+
+static void
+aarch64_make_imp_offset(const char* imp_label,
+			const char* imp_symbol, unsigned offset, unsigned rd,
+			const char* caller_label, bfd* parent)
+{
+  if (pe_dll_extra_pe_debug)
+    printf("impl_label: %s imp_symbol: %s offset: %u rs: %u caller: %s\n",
+	   imp_label, imp_symbol, offset, rd, caller_label);
+
+  asection *tx;
+  uint32_t *td = NULL;
+  char *oname;
+  bfd *abfd;
+  static int tmp_stub_seq = 0;
+  static const unsigned char imp_offset_bytes[] =
+  {
+    0x00, 0x00, 0x00, 0x90, /* adrp x0, <label>	     */
+    0x00, 0x00, 0x40, 0xf9, /* ldr x0, [x0, #imm]	   */
+    0x00, 0x00, 0x40, 0x91, /* applied when offset >= 4096  */
+			    /* add x0, x0, 0, lsl 12	*/
+    0x01, 0x00, 0x00, 0x14  /* b <label> + 4		*/
+  };
+  unsigned imp_offset_bytes_count = sizeof (imp_offset_bytes);
+  bool with_add_opcode = offset >= 4096;
+  if (!with_add_opcode)
+    imp_offset_bytes_count -= 4;
+
+  oname = xasprintf ("imp_offset_stub_d%06d.o", tmp_stub_seq);
+  ++tmp_stub_seq;
+
+  abfd = bfd_create (oname, parent);
+  free (oname);
+  bfd_make_writable (abfd);
+
+  bfd_set_format (abfd, bfd_object);
+  bfd_set_arch_mach (abfd, pe_details->bfd_arch, 0);
+
+  symptr = 0;
+  symtab = xmalloc (3 * sizeof (asymbol *));
+
+  tx  = quick_section (abfd, ".text", SEC_CODE | SEC_HAS_CONTENTS | SEC_READONLY, 2);
+  quick_symbol (abfd, "", imp_label, "", tx, BSF_GLOBAL, 0);
+  quick_symbol (abfd, "", imp_symbol, "", UNDSEC, BSF_GLOBAL, 0);
+  quick_symbol (abfd, "", caller_label, "", UNDSEC, BSF_GLOBAL, 0);
+
+  bfd_set_section_size (tx, imp_offset_bytes_count);
+  td = xmalloc (imp_offset_bytes_count);
+  tx->contents = (bfd_byte*) td;
+  memcpy (td, imp_offset_bytes, imp_offset_bytes_count);
+  if (!with_add_opcode)
+    memcpy (td + 2, imp_offset_bytes + 12, 4);
+
+  rd &= (1 << 5) - 1;
+  td[0] |= rd;
+
+
+  td[1] |= (rd << 5) | rd;
+  td[1] |= (rd << 5) | rd;
+
+  if (with_add_opcode)
+    {
+      int imm = (offset >> 12);
+      imm &= ((1 << 12) - 1);
+      td[2] |= (rd << 5) | rd;
+      td[2] |= (rd << 5) | rd;
+      td[2] |= imm << 10;
+    }
+
+  quick_reloc (abfd, 0, BFD_RELOC_AARCH64_ADR_HI21_NC_PCREL, 2);
+  quick_reloc (abfd, 4, BFD_RELOC_AARCH64_LDST64_LO12, 2);
+  quick_reloc (abfd, with_add_opcode ? 12: 8, BFD_RELOC_AARCH64_CALL26, 3);
+  save_relocs (tx);
+
+  bfd_set_symtab (abfd, symtab, symptr);
+
+  bfd_set_section_contents (abfd, tx, td, 0, imp_offset_bytes_count);
+  bfd_make_readable (abfd);
+  add_bfd_to_link (abfd, bfd_get_filename (abfd), &link_info);
+}
 #endif
 
 void
 pe_create_import_fixup (arelent *rel, asection *s, bfd_vma addend, char *name,
 			const char *symname)
 {
+#if defined (COFF_WITH_peAArch64)
+  if (rel->howto->bitsize == 21)
+    {
+      uint32_t opcode;
+      if (!bfd_get_section_contents (s->owner, s, &opcode, rel->address, 4))
+      {
+	einfo (_("%X%P: error: opcode cannot be read\n"));
+	return;
+      }
+
+      uint32_t imm = (opcode >> 5) & ((1 << 19) - 1);
+      imm <<= 2;
+      imm |= (opcode >> 29) & ((1 << 2) - 1);
+
+      const char* imp_prefix = "__imp_";
+      unsigned imp_symbol_size = strlen(imp_prefix) + strlen(name) + 1;
+      char *imp_symbol = xmalloc(imp_symbol_size);
+      snprintf(imp_symbol, imp_symbol_size, "%s%s", imp_prefix, name);
+
+      char imp_label_size = strlen(imp_symbol) + 0x40;
+      char *imp_label = xmalloc(imp_label_size);
+      snprintf(imp_label, imp_label_size, "%s_%x_%llx", imp_symbol,
+	       current_sec->id, rel->address);
+      const char *caller_label = make_import_fixup_mark (rel, name);
+      unsigned rd = opcode & ((1 << 5) - 1);
+      aarch64_make_imp_offset(imp_label, imp_symbol, imm, rd, caller_label,
+			      s->owner);
+
+      free (imp_label);
+      free (imp_symbol);
+    }
+  else if (rel->howto->bitsize == 26)
+    {
+  /* On AArch64, a single opcode is not sufficient for relocation
+  in dynamic linking. The linker generates a jump stub instead.  */
+      aarch64_make_jump_stub(name, s->owner);
+      return;
+    }
+
+  return;
+#endif
+
   const char *fixup_name = make_import_fixup_mark (rel, name);
   bfd *b;
 
@@ -2947,17 +3064,6 @@ pe_create_import_fixup (arelent *rel, asection *s, bfd_vma addend, char *name,
   if ((addend != 0 && link_info.pei386_runtime_pseudo_reloc == 1)
       || link_info.pei386_runtime_pseudo_reloc == 2)
     {
-#if defined (COFF_WITH_peAArch64)
-
-      if (rel->howto->bitsize == 26)
-	{
-/* On AArch64, a single opcode is not sufficient for relocation
-   in dynamic linking. The linker generates a jump stub instead.  */
-	  aarch64_make_jump_stub(name, s->owner);
-	  return;
-	}
-#endif
-
       if (pe_dll_extra_pe_debug)
 	printf ("creating runtime pseudo-reloc entry for %s (addend=%d)\n",
 		fixup_name, (int) addend);

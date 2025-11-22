@@ -266,26 +266,17 @@ static const reloc_howto_type arm64_reloc_howto_branch26
 = HOW (IMAGE_REL_ARM64_BRANCH26,
        2, 4, 26, true, 0, signed, NULL, 0x3ffffff);
 
-/* On AArch64 COFF, a custom relocation, such as
-   coff_aarch64_rel21_reloc func, is used.
-   The reloc_howto_struct is not used in the usual way.
-   The mask is set to 0 to avoid issues during dynamic linking.  */
 static const reloc_howto_type arm64_reloc_howto_page21
 = HOW (IMAGE_REL_ARM64_PAGEBASE_REL21,
-       12, 4, 21, true, 0, signed, rel21_reloc, 0);
+       12, 4, 21, true, 0, signed, rel21_reloc, 0x1fffff);
 
 static const reloc_howto_type arm64_reloc_howto_lo21
 = HOW (IMAGE_REL_ARM64_REL21,
        0, 4, 21, true, 0, signed, rel21_reloc, 0x1fffff);
 
-/* Similar to IMAGE_REL_ARM64_PAGEBASE_REL21.
-   On AArch64 COFF, a custom relocation, such as
-   coff_aarch64_po12l_reloc func, is used.
-   The reloc_howto_struct is not used in the usual way.
-   The overflow func is set to dont to avoid issues during dynamic linking.  */
 static const reloc_howto_type arm64_reloc_howto_pgoff12l
 = HOW (IMAGE_REL_ARM64_PAGEOFFSET_12L,
-       0, 4, 12, true, 10, dont, po12l_reloc, 0x3ffc00);
+       0, 4, 12, true, 10, signed, po12l_reloc, 0x3ffc00);
 
 static const reloc_howto_type arm64_reloc_howto_branch19
 = HOW (IMAGE_REL_ARM64_BRANCH19,
@@ -530,7 +521,30 @@ coff_pe_aarch64_relocate_section (bfd *output_bfd,
 
       h = obj_coff_sym_hashes (input_bfd)[symndx];
 
-      if (h && h->root.type == bfd_link_hash_defined)
+      if (h && h->root.type == bfd_link_hash_defweak)
+	{
+	  if (rel->r_type == IMAGE_REL_ARM64_PAGEBASE_REL21)
+	    {
+	      uint32_t opcode = 0x14000000; /* b <label>.  */
+	      bfd_putl32 (opcode, contents + rel->r_vaddr);
+
+	      char imp_label[0x100];
+	      snprintf(imp_label, sizeof(imp_label), "%s_%x_%llx",
+		h->root.root.string, input_section->id, rel->r_vaddr);
+	      h = (struct coff_link_hash_entry*)
+		  bfd_link_hash_lookup (info->hash, imp_label, 0, 0, 1);
+	      rel->r_type = IMAGE_REL_ARM64_BRANCH26;
+	    }
+
+	  if (!h || rel->r_type == IMAGE_REL_ARM64_PAGEOFFSET_12A)
+	    {
+	      rel->r_vaddr = -1;
+	      continue;
+	    }
+	}
+
+      if (h && (h->root.type == bfd_link_hash_defined
+	  || h->root.type == bfd_link_hash_defweak))
 	{
 	  sec = h->root.u.def.section;
 	  sym_value = h->root.u.def.value;
